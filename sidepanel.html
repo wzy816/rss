@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="sidepanel.css" />
+</head>
+
+<body>
+    <header>
+        <h1>RSS</h1>
+        <button id="refresh" title="Refresh all feeds">⟳</button>
+        <button id="toggle-filter" title="Show all / unread only">☰</button>
+        <button id="mark-all-read" title="Mark all articles as read">☑</button>
+        <button id="toggle-settings" title="Manage feeds">⚙</button>
+    </header>
+
+    <div id="undo-bar" hidden>
+        <span id="undo-text"></span>
+        <button id="undo-btn" type="button">Undo</button>
+    </div>
+
+    <section id="settings" hidden>
+        <div class="row">
+            <input id="feed-url" type="url" placeholder="https://example.com/feed.xml" />
+            <button id="add-feed">Add</button>
+            <button id="remove-all-feeds" class="danger">Remove all</button>
+        </div>
+
+        <div class="row opml-row">
+            <button id="import-opml" class="ghost">Import OPML</button>
+            <button id="export-opml" class="ghost">Export OPML</button>
+        </div>
+
+        <input id="opml-file" type="file" accept=".opml,.xml,text/xml,application/xml" hidden />
+
+        <ul id="feed-list"></ul>
+    </section>
+
+    <main id="article-list"></main>
+
+    <script src="sidepanel.js"></script>
+</body>
+
+</html>
