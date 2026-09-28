@@ -200,6 +200,7 @@ header button:disabled { opacity: 0.55; cursor: default; }
 }
 
 .article {
+  position: relative;
   display: block;
   padding: 8px 12px;
   background: #fff;
@@ -213,6 +214,7 @@ header button:disabled { opacity: 0.55; cursor: default; }
 
 .article .title {
   margin-bottom: 3px;
+  padding-right: 28px;       
   font-weight: 500;
   color: #0366d6;
   line-height: 1.35;
@@ -233,6 +235,41 @@ header button:disabled { opacity: 0.55; cursor: default; }
 }
 
 .article .meta { font-size: 11px; color: #888; }
+
+.article .read-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  color: #8a8a8a;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.25;
+  transition: opacity 120ms ease, color 120ms ease,
+              background 120ms ease, border-color 120ms ease;
+}
+.article:hover .read-btn { opacity: 1; }
+.article .read-btn:hover {
+  color: #0a0;
+  background:#f0fff4;
+  border-color: #0a0;
+}
+.article .read-btn:active { transform: scale(0.94); }
+.article .read-btn:focus-visible {
+  opacity: 1;
+  outline: 2px solid #0366d6;
+  outline-offset: 1px;
+}
+
 .empty { padding: 24px; text-align: center; color: #999; }
 
 .opml-row { margin-top: 8px; }

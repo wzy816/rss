@@ -267,10 +267,10 @@ async function render() {
       listEl.appendChild(header);
       lastKey = key;
     }
+    const isRead = readSet.has(a.id);
 
-    const wrap = document.createElement("a");
-    wrap.className = "article" + (readSet.has(a.id) ? " read" : "");
-    wrap.href = a.link;
+    const wrap = document.createElement("div");
+    wrap.className = "article" + (isRead ? " read" : "");
     wrap.title = a.link;
 
     const title = document.createElement("div");
@@ -292,13 +292,32 @@ async function render() {
       .join(" · ");
     wrap.appendChild(meta);
 
+    // ★ 单篇「标为已读」按钮：只标记已读，不打开链接。
+    //   已读文章不再显示该按钮。
+    if (!isRead) {
+      const readBtn = document.createElement("button");
+      readBtn.type = "button";
+      readBtn.className = "read-btn";
+      readBtn.textContent = "✓";
+      readBtn.title = "Mark as read";
+      readBtn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();          // ★ 阻止冒泡到 wrap，避免打开链接
+        await markRead(a.id);         // storage.onChanged → scheduleRender()
+      });
+      wrap.appendChild(readBtn);
+    }
+
     wrap.addEventListener("click", async (e) => {
-      e.preventDefault();
-      const url = wrap.href;
+      // 点在已读按钮（或其内部）时不打开链接
+      if (e.target.closest(".read-btn")) return;
+
+      const url = a.link;
       if (!/^https?:/i.test(url)) return;
       await markRead(a.id);
       chrome.tabs.create({ url });
     });
+
     listEl.appendChild(wrap);
   }
   renderFeedList(feeds, feedStatus);

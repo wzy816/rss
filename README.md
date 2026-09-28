@@ -13,6 +13,7 @@ A minimal RSS/Atom reader in the Chrome side panel.
 - Refreshes in the background every x minutes, plus a manual ⟳ button
 - Articles appear as each feed finishes, no waiting for the whole batch
 - Read /unread tracking that survives refreshes
+- Mark a single article as read (`✓`) without opening it
 - Filter between all posts (`☰`) and unread only (`●`)
 - Mark all as read (`☑`) with an 8-second undo
 - Date-grouped article list with `Today` / `Yesterday` headers
@@ -37,6 +38,7 @@ A minimal RSS/Atom reader in the Chrome side panel.
 - **Remove a feed** — click × next to it, or **Remove all** in settings.
 - **Import /export OPML** — buttons in ⚙ settings.
 - **Read an article** — click it. Opens in a new tab and marks it read.
+- **Mark one article as read** — click ✓ on the article; the link won't open.
 - **Filter unread** — click ☰ / ● in the header.
 - **Mark all as read** — click ☑. Click **Undo** in the banner if it was a mistake.
 
