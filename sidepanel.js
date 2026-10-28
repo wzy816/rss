@@ -4,6 +4,7 @@ const settingsEl = document.getElementById("settings");
 const feedUrlEl = document.getElementById("feed-url");
 const refreshBtn = document.getElementById("refresh");
 const toggleFilterBtn = document.getElementById("toggle-filter");
+const openAllUnreadBtn = document.getElementById("open-all-unread");
 const markAllReadBtn = document.getElementById("mark-all-read"); 
 const undoBarEl = document.getElementById("undo-bar");     
 const undoTextEl = document.getElementById("undo-text");   
@@ -354,8 +355,10 @@ function hideUndoBar() {
   undoBarEl.hidden = true;
 }
 
-function showUndoBar(count) {
-  undoTextEl.textContent = `Marked ${count} article${count === 1 ? "" : "s"} as read.`;
+function showUndoBar(count, message) {
+  undoTextEl.textContent =
+    message ||
+    `Marked ${count} article${count === 1 ? "" : "s"} as read.`;
   undoBarEl.hidden = false;
 }
 
@@ -408,6 +411,80 @@ undoBtnEl.addEventListener("click", async () => {
   const restored = readIds.filter((id) => !idsToRestore.has(id));
   await chrome.storage.local.set({ readIds: restored });
   // storage.onChanged 会触发 render()，未读列表会立即恢复
+});
+
+// ==================== Open all unread (+ mark read) ====================
+// 按列表顺序在标签页里打开所有未读文章（第一张切到前台，方便直接阅读），
+// 然后只把成功打开的文章标为已读。单篇打开失败时保留未读，方便重试。
+const OPEN_ALL_ICON = "↗";
+const OPEN_ALL_TITLE = "Open all unread in new tabs, then mark read";
+
+function flashOpenAllButton(count) {
+  openAllUnreadBtn.classList.add("marked");
+  openAllUnreadBtn.textContent = String(count);
+  openAllUnreadBtn.title =
+    count === 0
+      ? "No unread articles to open"
+      : `Opened ${count} unread article${count === 1 ? "" : "s"}`;
+  openAllUnreadBtn.disabled = true;
+  setTimeout(() => {
+    openAllUnreadBtn.classList.remove("marked");
+    openAllUnreadBtn.textContent = OPEN_ALL_ICON;
+    openAllUnreadBtn.title = OPEN_ALL_TITLE;
+    openAllUnreadBtn.disabled = false;
+  }, count === 0 ? 900 : 1200);
+}
+
+openAllUnreadBtn.addEventListener("click", async () => {
+  if (openAllUnreadBtn.disabled) return;
+  // 先禁用，避免 getState 期间重复点击打开两批标签页
+  openAllUnreadBtn.disabled = true;
+
+  const { articles, readIds } = await getState();
+  const readSet = new Set(readIds);
+  const unread = articles.filter((a) => !readSet.has(a.id));
+
+  if (unread.length === 0) {
+    flashOpenAllButton(0);
+    return;
+  }
+
+  openAllUnreadBtn.textContent = "…";
+  openAllUnreadBtn.title = "Opening…";
+
+  const openedIds = [];
+  let isFirst = true;
+  for (const a of unread) {
+    if (!/^https?:/i.test(a.link || "")) continue;
+    try {
+      await chrome.tabs.create({ url: a.link, active: isFirst });
+      openedIds.push(a.id);
+      isFirst = false;
+    } catch {
+      // 打开失败的保留为未读，用户可以重试
+    }
+  }
+
+  if (openedIds.length > 0) {
+    // 重新读取，避免覆盖期间由别处产生的已读记录
+    const { readIds: latestReadIds = [] } = await chrome.storage.local.get("readIds");
+    const merged = new Set(latestReadIds);
+    for (const id of openedIds) merged.add(id);
+    await chrome.storage.local.set({ readIds: [...merged] });
+
+    hideUndoBar();
+    pendingUndo = {
+      ids: openedIds,
+      timeoutId: setTimeout(() => { hideUndoBar(); }, UNDO_WINDOW_MS),
+    };
+    showUndoBar(
+      openedIds.length,
+      `Opened ${openedIds.length} unread article${openedIds.length === 1 ? "" : "s"} ` +
+      `in new tabs and marked ${openedIds.length === 1 ? "it" : "them"} as read.`
+    );
+  }
+
+  flashOpenAllButton(openedIds.length);
 });
 document.getElementById("toggle-settings").addEventListener("click", () => {
   settingsEl.hidden = !settingsEl.hidden;

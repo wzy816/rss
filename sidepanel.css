@@ -39,22 +39,22 @@ header button {
 header button:hover { background: #f0f0f0; }
 header button:disabled { opacity: 0.55; cursor: default; }
 
-/* 过滤切换按钮：自动宽度 + 小字号 */
-/* #toggle-filter {
-  width: auto;
-  min-width: 28px;
-  padding: 0 8px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-}
- */
+
 
 #toggle-filter {
   width: auto;
   min-width: 28px;
   padding: 0 8px;
   font-size: 15px;
+  line-height: 1;
+  font-weight: 600;
+}
+
+#open-all-unread {
+  width: auto;
+  min-width: 28px;
+  padding: 0 8px;
+  font-size: 11px;
   line-height: 1;
   font-weight: 600;
 }
@@ -69,7 +69,8 @@ header button:disabled { opacity: 0.55; cursor: default; }
   font-variant-numeric: tabular-nums;
 }
 
-#mark-all-read.marked {
+#mark-all-read.marked 
+#open-all-unread.marked {
   width: auto;
   min-width: 28px;
   padding: 0 8px;
