@@ -5,20 +5,68 @@ const feedUrlEl = document.getElementById("feed-url");
 const refreshBtn = document.getElementById("refresh");
 const toggleFilterBtn = document.getElementById("toggle-filter");
 const openAllUnreadBtn = document.getElementById("open-all-unread");
-const markAllReadBtn = document.getElementById("mark-all-read"); 
-const undoBarEl = document.getElementById("undo-bar");     
-const undoTextEl = document.getElementById("undo-text");   
-const undoBtnEl = document.getElementById("undo-btn");     
+const markAllReadBtn = document.getElementById("mark-all-read");
+const removeAllFeedsBtn = document.getElementById("remove-all-feeds");
+const undoBarEl = document.getElementById("undo-bar");
+const undoTextEl = document.getElementById("undo-text");
+const undoBtnEl = document.getElementById("undo-btn");
+
+// The background writes a progress heartbeat every 15s while a fetch is in
+// flight, so this can stay short even though one feed may take up to 480s.
+const PROGRESS_STALE_MS = 60 * 1000;
+// A slow-feed probe may legitimately run for the full 480s timeout.
+const PROBE_MAX_WAIT_MS = 510 * 1000;
+const MSG_RETRY_DELAY_MS = 150;
 
 const pendingProbes = new Set();
+const probeTimers = new Map();
 
 let renderTimer = null;
 function scheduleRender() {
   if (renderTimer) return;
   renderTimer = setTimeout(() => {
     renderTimer = null;
-    render();
+    renderSafe();
   }, 200);
+}
+
+function renderSafe() {
+  return render().catch((e) => {
+    console.warn("RSS: render failed:", e);
+  });
+}
+
+// ---------- Messaging ----------
+// chrome.runtime.sendMessage rejects when the service worker goes away before
+// answering ("message channel closed before a response was received"). That is
+// not fatal: the worker is restarted on the next message, so retry once and
+// never let the rejection escape as an unhandled promise.
+const MSG_CHANNEL_CLOSED =
+  /message channel closed|message port closed|receiving end does not exist|could not establish connection|extension context invalidated/i;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendMessageSafe(message, { retries = 1 } = {}) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await chrome.runtime.sendMessage(message);
+    } catch (e) {
+      lastError = e;
+      const text = String(e?.message || e);
+      if (attempt >= retries || !MSG_CHANNEL_CLOSED.test(text)) break;
+      await sleep(MSG_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+
+  console.warn(
+    `RSS: background request "${message?.action}" failed:`,
+    lastError?.message || lastError
+  );
+  return null;
 }
 
 async function getState() {
@@ -28,7 +76,8 @@ async function getState() {
     "readIds",
     "lastRefresh",
     "filterMode",
-    "feedStatus",  
+    "feedStatus",
+    "skippedFeedIds",
   ]);
   return {
     feeds: s.feeds || [],
@@ -36,7 +85,8 @@ async function getState() {
     readIds: s.readIds || [],
     lastRefresh: s.lastRefresh || 0,
     filterMode: s.filterMode || "all",
-    feedStatus: s.feedStatus || {},   
+    feedStatus: s.feedStatus || {},
+    skippedFeedIds: s.skippedFeedIds || [],
   };
 }
 
@@ -46,7 +96,7 @@ function formatDate(str) {
   return isNaN(d.getTime()) ? "" : d.toLocaleString();
 }
 
-// 取文章的日期键，忽略时分秒，便于分组。无效日期返回 null。
+// Date key ignoring time-of-day, for grouping. Invalid dates return null.
 function dateKey(pubDate) {
   if (!pubDate) return null;
   const d = new Date(pubDate);
@@ -54,7 +104,7 @@ function dateKey(pubDate) {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-// 把 "2026-8-12" 这样的键转成 "Today" / "Yesterday" / "September 12"。
+// "2026-8-12" -> "Today" / "Yesterday" / "September 12".
 function formatGroupDate(key) {
   const [y, m, d] = key.split("-").map(Number);
   const date = new Date(y, m, d);
@@ -83,22 +133,109 @@ async function markRead(id) {
 }
 
 async function removeFeed(id) {
-  const { feeds } = await getState();
-  await chrome.storage.local.set({ feeds: feeds.filter((f) => f.id !== id) });
+  const { feeds, skippedFeedIds, feedStatus } = await getState();
+
+  const nextStatus = { ...feedStatus };
+  delete nextStatus[id];
+
+  await chrome.storage.local.set({
+    feeds: feeds.filter((f) => f.id !== id),
+    skippedFeedIds: skippedFeedIds.filter((x) => x !== id),
+    feedStatus: nextStatus,
+  });
 }
 
-// ★ 刷新按钮状态：进行中显示 "done/total"，否则显示 ⟳
-function applyRefreshState(p) {
-  const isFresh =
-    p?.active &&
-    (!p.startedAt || Date.now() - p.startedAt < 5 * 60 * 1000);
+// ---------- Probe pending state ----------
+function setProbePending(id, pending) {
+  const existing = probeTimers.get(id);
+  if (existing) {
+    clearTimeout(existing);
+    probeTimers.delete(id);
+  }
 
-  if (isFresh) {
-    refreshBtn.classList.add("refreshing");
-    refreshBtn.textContent = `${p.done || 0}/${p.total || 0}`;
-    refreshBtn.disabled = true;
-    refreshBtn.title = "Refreshing…";
+  if (pending) {
+    pendingProbes.add(id);
+    // Fallback: if the worker dies and no status ever arrives, don't leave
+    // the button stuck on "…".
+    probeTimers.set(
+      id,
+      setTimeout(() => {
+        probeTimers.delete(id);
+        pendingProbes.delete(id);
+        scheduleRender();
+      }, PROBE_MAX_WAIT_MS)
+    );
   } else {
+    pendingProbes.delete(id);
+  }
+}
+
+// ---------- Refresh state (storage-driven) ----------
+function isProgressFresh(progress) {
+  if (!progress?.active) return false;
+  const ts = progress.updatedAt || progress.startedAt || 0;
+  return Date.now() - ts < PROGRESS_STALE_MS;
+}
+
+let refreshWatchdog = null;
+
+function armRefreshWatchdog() {
+  clearTimeout(refreshWatchdog);
+  refreshWatchdog = setTimeout(async () => {
+    refreshWatchdog = null;
+
+    try {
+      const { refreshProgress } = await chrome.storage.local.get(
+        "refreshProgress"
+      );
+
+      if (isProgressFresh(refreshProgress)) {
+        armRefreshWatchdog();
+        return;
+      }
+
+      if (refreshProgress?.active) {
+        // The worker died mid-refresh (or stopped writing). Clear the flag so
+        // the ⟳ button becomes usable immediately instead of staying disabled.
+        try {
+          await chrome.storage.local.set({
+            refreshProgress: {
+              ...refreshProgress,
+              active: false,
+              stale: true,
+              finishedAt: Date.now(),
+            },
+          });
+        } catch (e) {
+          console.warn("RSS: could not clear stale progress:", e);
+        }
+      }
+    } catch (e) {
+      console.warn("RSS: could not check refresh progress:", e);
+    }
+
+    applyRefreshState(null);
+  }, PROGRESS_STALE_MS + 1000);
+}
+
+function applyRefreshState(progress) {
+  if (isProgressFresh(progress)) {
+    const done = progress.done || 0;
+    const total = progress.total || 0;
+    const skipped = progress.skipped || 0;
+    const slow = progress.slow || 0;
+
+    refreshBtn.classList.add("refreshing");
+    refreshBtn.textContent = `${done}/${total}`;
+    refreshBtn.disabled = true;
+    refreshBtn.title =
+      `Refreshing… ${done}/${total}` +
+      (slow ? ` — ${slow} slow` : "") +
+      (skipped ? ` — ${skipped} skipped` : "");
+    armRefreshWatchdog();
+  } else {
+    clearTimeout(refreshWatchdog);
+    refreshWatchdog = null;
     refreshBtn.classList.remove("refreshing");
     refreshBtn.textContent = "⟳";
     refreshBtn.disabled = false;
@@ -106,9 +243,51 @@ function applyRefreshState(p) {
   }
 }
 
-function renderFeedList(feeds, feedStatus) {
+let refreshRequestSeq = 0;
+
+async function requestRefresh(reason = "manual") {
+  const seq = ++refreshRequestSeq;
+  refreshBtn.disabled = true;
+
+  // If the worker dies before writing any progress at all, there would be no
+  // storage event to re-enable the button. Check once after a short grace.
+  setTimeout(async () => {
+    if (seq !== refreshRequestSeq) return;
+    try {
+      const { refreshProgress } = await chrome.storage.local.get(
+        "refreshProgress"
+      );
+      if (!isProgressFresh(refreshProgress)) applyRefreshState(null);
+    } catch {
+      applyRefreshState(null);
+    }
+  }, 5000);
+
+  const res = await sendMessageSafe({ action: "refresh", reason });
+
+  if (!res || res.ok !== true) {
+    applyRefreshState(null);
+    return false;
+  }
+
+  if (res.alreadyRunning) {
+    const { refreshProgress } = await chrome.storage.local.get("refreshProgress");
+    applyRefreshState(refreshProgress);
+  }
+
+  return true;
+}
+
+// ---------- Feed list ----------
+function isSuspendedNow(status) {
+  if (!status?.suspended) return false;
+  return !status.suspendedUntil || status.suspendedUntil > Date.now();
+}
+
+function renderFeedList(feeds, feedStatus, skippedFeedIds) {
   feedListEl.innerHTML = "";
 
+  const skippedSet = new Set(skippedFeedIds || []);
   const sorted = [...feeds].sort((a, b) => {
     const ta = (a.title || a.url || "").toLowerCase();
     const tb = (b.title || b.url || "").toLowerCase();
@@ -118,7 +297,7 @@ function renderFeedList(feeds, feedStatus) {
   for (const f of sorted) {
     const li = document.createElement("li");
 
-    // ---- 第一行：标题 + 按钮 ----
+    // ---- Row: title + action buttons ----
     const row = document.createElement("div");
     row.className = "feed-row";
 
@@ -127,38 +306,38 @@ function renderFeedList(feeds, feedStatus) {
     span.title = f.url;
     row.appendChild(span);
 
-    // ---- 探测按钮 ----
+    const status = feedStatus[f.id];
+    const manualSkip = skippedSet.has(f.id);
+    const suspended = isSuspendedNow(status);
+    const slow = !!(status && status.ok === false && status.slow);
+    const pending = pendingProbes.has(f.id);
+
+    // ---- Probe / retry button ----
     const probe = document.createElement("button");
+    probe.type = "button";
     probe.className = "probe";
 
-    let state = "unknown";
-    let count = 0;
-    let error = "";
-
-    if (pendingProbes.has(f.id)) {
-      state = "pending";
-    } else if (feedStatus[f.id]) {
-      const st = feedStatus[f.id];
-      if (st.ok) {
-        state = "ok";
-        count = st.count;
-      } else {
-        state = "error";
-        error = st.error;
-      }
-    }
-
-    if (state === "pending") {
+    if (pending) {
       probe.textContent = "…";
       probe.title = "Testing…";
       probe.disabled = true;
-    } else if (state === "ok") {
+    } else if (status?.ok) {
       probe.textContent = "✓";
-      probe.title = `OK — ${count} item${count === 1 ? "" : "s"}`;
+      probe.title =
+        `OK — ${status.count || 0} item${status.count === 1 ? "" : "s"}` +
+        (manualSkip ? " (feed is skipped)" : "");
       probe.classList.add("ok");
-    } else if (state === "error") {
+    } else if (slow) {
+      probe.textContent = "⏱";
+      probe.title =
+        `Slow feed — ${status.error || "last attempt timed out"}. ` +
+        "Click to test now.";
+      probe.classList.add("slow");
+    } else if (status && status.ok === false) {
       probe.textContent = "✗";
-      probe.title = error;
+      probe.title =
+        (status.error || "Feed failed") +
+        (suspended ? " — click to retry now" : "");
       probe.classList.add("error");
     } else {
       probe.textContent = "⚡";
@@ -166,26 +345,62 @@ function renderFeedList(feeds, feedStatus) {
     }
 
     probe.addEventListener("click", async () => {
-      pendingProbes.add(f.id);
-      renderFeedList(feeds, feedStatus);
-      try {
-        await chrome.runtime.sendMessage({
-          action: "probeFeed",
-          feedId: f.id,
-          url: f.url,
-        });
-      } catch (e) {
-        const { feedStatus: current = {} } = await chrome.storage.local.get("feedStatus");
-        current[f.id] = { ok: false, error: String(e?.message || e), at: Date.now() };
-        await chrome.storage.local.set({ feedStatus: current });
-      } finally {
-        pendingProbes.delete(f.id);
+      if (pendingProbes.has(f.id)) return;
+      const probeStartedAt = Date.now();
+      setProbePending(f.id, true);
+      scheduleRender();
+
+      const res = await sendMessageSafe({
+        action: "probeFeed",
+        feedId: f.id,
+        url: f.url,
+      });
+
+      if (!res) {
+        const { feedStatus: current = {} } = await chrome.storage.local.get(
+          "feedStatus"
+        );
+        const existing = current[f.id];
+        // If the worker finished the probe but the reply was lost with the
+        // channel, keep its result instead of overwriting it with an error.
+        if (!existing || !existing.at || existing.at < probeStartedAt) {
+          current[f.id] = {
+            ...(current[f.id] || {}),
+            ok: false,
+            error: "Background did not respond. Try again.",
+            at: Date.now(),
+          };
+          await chrome.storage.local.set({ feedStatus: current });
+        }
       }
+
+      setProbePending(f.id, false);
+      scheduleRender();
     });
     row.appendChild(probe);
 
-    // ---- 复制 URL 按钮 ----
+    // ---- Skip / resume button ----
+    const skip = document.createElement("button");
+    skip.type = "button";
+    skip.className = "skip" + (manualSkip ? " active" : "");
+    skip.textContent = manualSkip ? "▶" : "⏸";
+    skip.title = manualSkip
+      ? "Skipped on refresh — click to include it again"
+      : "Skip this feed on refresh (keeps it subscribed)";
+    skip.addEventListener("click", async () => {
+      const { skippedFeedIds: current = [] } = await chrome.storage.local.get(
+        "skippedFeedIds"
+      );
+      const set = new Set(current);
+      if (set.has(f.id)) set.delete(f.id);
+      else set.add(f.id);
+      await chrome.storage.local.set({ skippedFeedIds: [...set] });
+    });
+    row.appendChild(skip);
+
+    // ---- Copy URL button ----
     const copy = document.createElement("button");
+    copy.type = "button";
     copy.className = "copy";
     copy.textContent = "⧉";
     copy.title = "Copy feed URL";
@@ -200,38 +415,88 @@ function renderFeedList(feeds, feedStatus) {
         }, 1200);
       } catch (e) {
         copy.textContent = "✗";
-        setTimeout(() => { copy.textContent = "⧉"; }, 1200);
+        setTimeout(() => {
+          copy.textContent = "⧉";
+        }, 1200);
       }
     });
     row.appendChild(copy);
 
-    // ---- 删除按钮 ----
+    // ---- Remove button ----
     const del = document.createElement("button");
+    del.type = "button";
     del.className = "remove";
     del.textContent = "×";
     del.title = "Remove";
     del.addEventListener("click", async () => {
       await removeFeed(f.id);
-      pendingProbes.delete(f.id);
-      render();
+      setProbePending(f.id, false);
+      renderSafe();
     });
     row.appendChild(del);
 
     li.appendChild(row);
 
-    // ---- 第二行：错误信息（仅失败时显示） ----
-    if (state === "error" && error) {
+    // ---- Second line: why a feed is skipped / failed ----
+    if (suspended) {
+      const note = document.createElement("div");
+      note.className = "feed-note";
+
+      const text = document.createElement("span");
+      const attempts = status.failStreak || 1;
+      text.textContent =
+        `Auto-skipped after ${attempts} failed refresh${attempts === 1 ? "" : "es"}` +
+        (status.error ? `: ${status.error}` : "") +
+        (status.suspendedUntil > Date.now()
+          ? ` · retried automatically after ${new Date(
+              status.suspendedUntil
+            ).toLocaleString()}`
+          : "");
+      note.appendChild(text);
+
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "retry";
+      retry.textContent = "Retry now";
+      retry.addEventListener("click", () => probe.click());
+      note.appendChild(retry);
+
+      li.appendChild(note);
+    } else if (manualSkip) {
+      const note = document.createElement("div");
+      note.className = "feed-note";
+      note.textContent =
+        "Skipped on refresh. Click ▶ to include this feed again.";
+      li.appendChild(note);
+    } else if (slow) {
+      const note = document.createElement("div");
+      note.className = "feed-note";
+      const nextSecs = status.timeoutMs
+        ? Math.round(status.timeoutMs / 1000)
+        : 0;
+      note.textContent =
+        `Slow feed — ${status.error || "last attempt timed out"}.` +
+        (nextSecs ? ` Next attempt allows up to ${nextSecs}s.` : "");
+      li.appendChild(note);
+    } else if (status && status.ok === false && status.skipped) {
+      const note = document.createElement("div");
+      note.className = "feed-note";
+      note.textContent = status.error || "Skipped this refresh.";
+      li.appendChild(note);
+    } else if (status && status.ok === false && status.error) {
       const err = document.createElement("div");
       err.className = "feed-error";
-      err.textContent = error;
+      err.textContent = status.error;
       li.appendChild(err);
     }
 
     feedListEl.appendChild(li);
   }
 }
+
 async function render() {
-  const { feeds, articles, readIds, filterMode, feedStatus } = await getState();
+  const { feeds, articles, readIds, filterMode, feedStatus, skippedFeedIds } =
+    await getState();
   const readSet = new Set(readIds);
 
   const visible =
@@ -256,11 +521,11 @@ async function render() {
     listEl.appendChild(p);
   }
 
-  let lastKey = "__init__";   // 用一个不会和任何 dateKey 碰撞的哨兵值
+  let lastKey = "__init__"; // sentinel that cannot collide with a dateKey
   for (const a of visible) {
-    const key = dateKey(a.pubDate);   // null 表示无日期
+    const key = dateKey(a.pubDate); // null = no date
 
-    // ★ 日期变化时插入分组标题
+    // Insert a date header whenever the day changes.
     if (key !== lastKey) {
       const header = document.createElement("div");
       header.className = "date-header";
@@ -293,8 +558,7 @@ async function render() {
       .join(" · ");
     wrap.appendChild(meta);
 
-    // ★ 单篇「标为已读」按钮：只标记已读，不打开链接。
-    //   已读文章不再显示该按钮。
+    // Mark-as-read button: does not open the link. Hidden when already read.
     if (!isRead) {
       const readBtn = document.createElement("button");
       readBtn.type = "button";
@@ -303,14 +567,13 @@ async function render() {
       readBtn.title = "Mark as read";
       readBtn.addEventListener("click", async (e) => {
         e.preventDefault();
-        e.stopPropagation();          // ★ 阻止冒泡到 wrap，避免打开链接
-        await markRead(a.id);         // storage.onChanged → scheduleRender()
+        e.stopPropagation(); // don't bubble to wrap and open the link
+        await markRead(a.id); // storage.onChanged -> scheduleRender()
       });
       wrap.appendChild(readBtn);
     }
 
     wrap.addEventListener("click", async (e) => {
-      // 点在已读按钮（或其内部）时不打开链接
       if (e.target.closest(".read-btn")) return;
 
       const url = a.link;
@@ -321,19 +584,12 @@ async function render() {
 
     listEl.appendChild(wrap);
   }
-  renderFeedList(feeds, feedStatus);
+
+  renderFeedList(feeds, feedStatus, skippedFeedIds);
 }
 
-refreshBtn.addEventListener("click", async () => {
-  // 立即禁用，避免在 storage 更新前重复点击；
-  // 最终状态由 refreshProgress 的 storage 变化驱动。
-  refreshBtn.disabled = true;
-  try {
-    await chrome.runtime.sendMessage({ action: "refresh" });
-  } catch {
-    // 出错时手动复位
-    applyRefreshState(null);
-  }
+refreshBtn.addEventListener("click", () => {
+  requestRefresh("manual");
 });
 
 toggleFilterBtn.addEventListener("click", async () => {
@@ -341,10 +597,11 @@ toggleFilterBtn.addEventListener("click", async () => {
   const next = filterMode === "all" ? "unread" : "all";
   await chrome.storage.local.set({ filterMode: next });
 });
+
 // ==================== Mark all as read (+ undo) ====================
-// 记录本次新标记的 id，撤销时只从 readIds 里移除这些 id，
-// 这样不会误伤撤销之前/之后单篇阅读产生的已读记录。
-let pendingUndo = null;      // { ids: string[], timeoutId: number }
+// Track only the ids marked by this action, so undo never removes read marks
+// created before/after it.
+let pendingUndo = null; // { ids: string[], timeoutId: number }
 const UNDO_WINDOW_MS = 8000;
 
 function hideUndoBar() {
@@ -378,29 +635,40 @@ markAllReadBtn.addEventListener("click", async () => {
     markAllReadBtn.classList.add("marked");
     markAllReadBtn.textContent = "0";
     markAllReadBtn.disabled = true;
-    setTimeout(() => { markAllReadBtn.classList.remove("marked");markAllReadBtn.textContent = "☑";markAllReadBtn.disabled = false; }, 900);
+    setTimeout(() => {
+      markAllReadBtn.classList.remove("marked");
+      markAllReadBtn.textContent = "☑";
+      markAllReadBtn.disabled = false;
+    }, 900);
     return;
   }
 
   await chrome.storage.local.set({ readIds: [...readSet] });
 
-  // 用数字短暂反馈，然后还原图标
   markAllReadBtn.classList.add("marked");
   markAllReadBtn.textContent = `${newlyRead.length}`;
   markAllReadBtn.disabled = true;
-  setTimeout(() => { markAllReadBtn.classList.remove("marked");markAllReadBtn.textContent = "☑";markAllReadBtn.disabled = false; }, 1200);
+  setTimeout(() => {
+    markAllReadBtn.classList.remove("marked");
+    markAllReadBtn.textContent = "☑";
+    markAllReadBtn.disabled = false;
+  }, 1200);
 
-  // 撤销窗口：如果之前还有未过期的撤销，先清掉再开新的
   hideUndoBar();
   pendingUndo = {
     ids: newlyRead,
-    timeoutId: setTimeout(() => { hideUndoBar(); }, UNDO_WINDOW_MS),
+    timeoutId: setTimeout(() => {
+      hideUndoBar();
+    }, UNDO_WINDOW_MS),
   };
   showUndoBar(newlyRead.length);
 });
 
 undoBtnEl.addEventListener("click", async () => {
-  if (!pendingUndo) { undoBarEl.hidden = true; return; }
+  if (!pendingUndo) {
+    undoBarEl.hidden = true;
+    return;
+  }
 
   const idsToRestore = new Set(pendingUndo.ids);
   clearTimeout(pendingUndo.timeoutId);
@@ -410,12 +678,9 @@ undoBtnEl.addEventListener("click", async () => {
   const { readIds } = await getState();
   const restored = readIds.filter((id) => !idsToRestore.has(id));
   await chrome.storage.local.set({ readIds: restored });
-  // storage.onChanged 会触发 render()，未读列表会立即恢复
 });
 
 // ==================== Open all unread (+ mark read) ====================
-// 按列表顺序在标签页里打开所有未读文章（第一张切到前台，方便直接阅读），
-// 然后只把成功打开的文章标为已读。单篇打开失败时保留未读，方便重试。
 const OPEN_ALL_ICON = "↗";
 const OPEN_ALL_TITLE = "Open all unread in new tabs, then mark read";
 
@@ -437,7 +702,6 @@ function flashOpenAllButton(count) {
 
 openAllUnreadBtn.addEventListener("click", async () => {
   if (openAllUnreadBtn.disabled) return;
-  // 先禁用，避免 getState 期间重复点击打开两批标签页
   openAllUnreadBtn.disabled = true;
 
   const { articles, readIds } = await getState();
@@ -461,13 +725,15 @@ openAllUnreadBtn.addEventListener("click", async () => {
       openedIds.push(a.id);
       isFirst = false;
     } catch {
-      // 打开失败的保留为未读，用户可以重试
+      // Keep failed opens unread so they can be retried.
     }
   }
 
   if (openedIds.length > 0) {
-    // 重新读取，避免覆盖期间由别处产生的已读记录
-    const { readIds: latestReadIds = [] } = await chrome.storage.local.get("readIds");
+    // Re-read to avoid overwriting read state created elsewhere meanwhile.
+    const { readIds: latestReadIds = [] } = await chrome.storage.local.get(
+      "readIds"
+    );
     const merged = new Set(latestReadIds);
     for (const id of openedIds) merged.add(id);
     await chrome.storage.local.set({ readIds: [...merged] });
@@ -475,17 +741,24 @@ openAllUnreadBtn.addEventListener("click", async () => {
     hideUndoBar();
     pendingUndo = {
       ids: openedIds,
-      timeoutId: setTimeout(() => { hideUndoBar(); }, UNDO_WINDOW_MS),
+      timeoutId: setTimeout(() => {
+        hideUndoBar();
+      }, UNDO_WINDOW_MS),
     };
     showUndoBar(
       openedIds.length,
-      `Opened ${openedIds.length} unread article${openedIds.length === 1 ? "" : "s"} ` +
-      `in new tabs and marked ${openedIds.length === 1 ? "it" : "them"} as read.`
+      `Opened ${openedIds.length} unread article${
+        openedIds.length === 1 ? "" : "s"
+      } in new tabs and marked ${
+        openedIds.length === 1 ? "it" : "them"
+      } as read.`
     );
   }
 
   flashOpenAllButton(openedIds.length);
 });
+
+// ==================== Settings ====================
 document.getElementById("toggle-settings").addEventListener("click", () => {
   settingsEl.hidden = !settingsEl.hidden;
 });
@@ -494,48 +767,71 @@ document.getElementById("add-feed").addEventListener("click", async () => {
   const url = feedUrlEl.value.trim();
   if (!/^https?:/i.test(url)) return;
 
-  let title = "";
-  try { title = new URL(url).hostname; } catch {}
-
   const { feeds } = await getState();
+  if (feeds.some((f) => f.url === url)) {
+    feedUrlEl.value = "";
+    renderSafe();
+    return;
+  }
+
+  let title = "";
+  try {
+    title = new URL(url).hostname;
+  } catch {}
+
   feeds.push({ id: "feed_" + Date.now(), url, title });
   await chrome.storage.local.set({ feeds });
 
   feedUrlEl.value = "";
-  render();
-  chrome.runtime.sendMessage({ action: "refresh" }).then(render);
+  await requestRefresh("add-feed");
+  renderSafe();
 });
 
 // ==================== Remove all subscriptions ====================
-document.getElementById("remove-all-feeds").addEventListener("click", async () => {
+removeAllFeedsBtn.addEventListener("click", async () => {
   const { feeds, articles } = await getState();
+
   if (feeds.length === 0) {
     removeAllFeedsBtn.textContent = "0";
-    setTimeout(() => { removeAllFeedsBtn.textContent = "Remove all"; }, 900);
+    setTimeout(() => {
+      removeAllFeedsBtn.textContent = "Remove all";
+    }, 900);
     return;
   }
 
   const ok = confirm(
-    `Remove all ${feeds.length} subscription${feeds.length === 1 ? "" : "s"} ` +
-    `and ${articles.length} stored article${articles.length === 1 ? "" : "s"}?\n\n` +
-    `This cannot be undone.`
+    `Remove all ${feeds.length} subscription${
+      feeds.length === 1 ? "" : "s"
+    } and ${articles.length} stored article${
+      articles.length === 1 ? "" : "s"
+    }?\n\nThis cannot be undone.`
   );
   if (!ok) return;
 
-  // 清空所有与订阅/文章相关的状态；filterMode 等 UI 偏好保留。
+  // Stop a running refresh first, otherwise it could write articles back
+  // while we are clearing storage.
+  await sendMessageSafe({ action: "cancelRefresh" });
+
   await chrome.storage.local.set({
     feeds: [],
     articles: [],
     readIds: [],
+    feedStatus: {},
+    skippedFeedIds: [],
     lastErrors: [],
     lastRefresh: 0,
+    refreshProgress: {
+      active: false,
+      done: 0,
+      total: 0,
+      finishedAt: Date.now(),
+    },
   });
 
   await chrome.action.setBadgeText({ text: "" });
-  // storage.onChanged 会触发 render()，列表和 feed 列表会立即清空
 });
-// ==================== OPML ====================
 
+// ==================== OPML ====================
 function escapeXml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -549,11 +845,11 @@ function buildOpml(feeds) {
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<opml version="2.0">',
-    '  <head>',
-    '    <title>RSS Subscriptions</title>',
+    "  <head>",
+    "    <title>RSS Subscriptions</title>",
     `    <dateCreated>${new Date().toUTCString()}</dateCreated>`,
-    '  </head>',
-    '  <body>',
+    "  </head>",
+    "  <body>",
   ];
   for (const f of feeds) {
     const title = escapeXml(f.title || f.url);
@@ -562,7 +858,7 @@ function buildOpml(feeds) {
       `    <outline type="rss" text="${title}" title="${title}" xmlUrl="${xmlUrl}" />`
     );
   }
-  lines.push('  </body>', '</opml>');
+  lines.push("  </body>", "</opml>");
   return lines.join("\n");
 }
 
@@ -605,12 +901,13 @@ async function importOpml(file) {
     if (seen.has(xmlUrl)) continue;
     seen.add(xmlUrl);
 
-    let title =
-      o.getAttribute("title") ||
-      o.getAttribute("text") ||
-      "";
+    let title = o.getAttribute("title") || o.getAttribute("text") || "";
     if (!title) {
-      try { title = new URL(xmlUrl).hostname; } catch { title = xmlUrl; }
+      try {
+        title = new URL(xmlUrl).hostname;
+      } catch {
+        title = xmlUrl;
+      }
     }
 
     imported.push({ url: xmlUrl, title });
@@ -652,23 +949,51 @@ document.getElementById("opml-file").addEventListener("change", async (e) => {
       alert("No feeds found in this file.");
       return;
     }
-    render();
+    renderSafe();
     if (result.added > 0) {
-      chrome.runtime.sendMessage({ action: "refresh" }).then(render);
+      await requestRefresh("import");
     }
-    alert(`Imported ${result.added} new feed(s). (${result.total} total in file, ${
-      result.total - result.added
-    } already subscribed.)`);
+    alert(
+      `Imported ${result.added} new feed(s). (${result.total} total in file, ${
+        result.total - result.added
+      } already subscribed.)`
+    );
   } catch (err) {
     alert("Import failed: " + (err?.message || err));
   }
 });
 
-// ==================== Storage 驱动刷新按钮 ====================
-
+// ==================== Storage-driven updates ====================
 async function initRefreshState() {
-  const { refreshProgress } = await chrome.storage.local.get("refreshProgress");
-  applyRefreshState(refreshProgress);
+  try {
+    const { refreshProgress } = await chrome.storage.local.get(
+      "refreshProgress"
+    );
+
+    if (refreshProgress?.active && !isProgressFresh(refreshProgress)) {
+      // Orphaned "active" left by a killed service worker.
+      try {
+        await chrome.storage.local.set({
+          refreshProgress: {
+            ...refreshProgress,
+            active: false,
+            stale: true,
+            finishedAt: Date.now(),
+          },
+        });
+      } catch (e) {
+        console.warn("RSS: could not clear stale progress:", e);
+      }
+      applyRefreshState(null);
+      return;
+    }
+
+    applyRefreshState(refreshProgress);
+  } catch (e) {
+    // Even if storage is unavailable, don't leave the ⟳ button stuck.
+    console.warn("RSS: could not read refresh progress:", e);
+    applyRefreshState(null);
+  }
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -683,12 +1008,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
     changes.feeds ||
     changes.readIds ||
     changes.filterMode ||
-    changes.feedStatus 
+    changes.feedStatus ||
+    changes.skippedFeedIds
   ) {
     scheduleRender();
   }
 });
 
-initRefreshState();
-render();
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) initRefreshState();
+});
 
+initRefreshState();
+renderSafe();

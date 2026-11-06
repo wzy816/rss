@@ -69,7 +69,7 @@ header button:disabled { opacity: 0.55; cursor: default; }
   font-variant-numeric: tabular-nums;
 }
 
-#mark-all-read.marked 
+#mark-all-read.marked,
 #open-all-unread.marked {
   width: auto;
   min-width: 28px;
@@ -174,10 +174,40 @@ header button:disabled { opacity: 0.55; cursor: default; }
 #feed-list li button.probe.ok:hover { color: #0a0; }
 #feed-list li button.probe.error { color: #d00; }
 #feed-list li button.probe.error:hover { color: #d00; }
+#feed-list li button.probe.slow { color: #c77700; }
+#feed-list li button.probe.slow:hover { color: #e08a00; }
 #feed-list li button.probe:disabled { opacity: 0.5; cursor: default; }
+
+/* Skip/resume toggle: neutral when active, red-ish when the feed is skipped */
+#feed-list li button.skip { color: #999; font-size: 11px; }
+#feed-list li button.skip:hover { color: #0366d6; }
+#feed-list li button.skip.active { color: #c00; }
+#feed-list li button.skip.active:hover { color: #d33; }
 
 #feed-list li button.remove { color: #999; font-size: 14px; }
 #feed-list li button.remove:hover { color: #d00; }
+
+/* Auto-suspended / skipped feed note (softer than a hard error) */
+#feed-list li .feed-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 2px 0 4px 0;
+  padding: 4px 6px;
+  background: #fffbe6;
+  color: #7a5b00;
+  font-size: 11px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+#feed-list li .feed-note span { flex: 1; }
+#feed-list li .feed-note button.retry {
+  flex: 0 0 auto;
+  padding: 0;
+  color: #0366d6;
+  font-size: 11px;
+  text-decoration: underline;
+}
 
 /* 让文章列表自己滚动，头部和设置区固定 */
 #article-list {

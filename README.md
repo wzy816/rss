@@ -12,6 +12,10 @@ A minimal RSS/Atom reader in the Chrome side panel.
 - RSS 2.0 and Atom support
 - Refreshes in the background every x minutes, plus a manual ⟳ button
 - Articles appear as each feed finishes, no waiting for the whole batch
+- Bounded refresh with per-feed timeouts and a global limit, so one dead source can't stall the run
+- Slow feeds get progressively longer timeouts (up to 8 minutes) and are not treated as broken
+- Hard-broken feeds are auto-skipped after 3 failures and retried after a cooldown; skip a feed manually with ⏸
+- Refresh progress recovers automatically if the service worker restarts
 - Read /unread tracking that survives refreshes
 - Mark a single article as read (`✓`) without opening it
 - Open all unread articles in new tabs and mark them read (`↗`), with undo
@@ -34,7 +38,9 @@ A minimal RSS/Atom reader in the Chrome side panel.
 ## Usage
 
 - **Add a feed** — click ⚙, paste the feed URL, click **Add**.
-- **Test a feed** — click ⚡. Shows ✓ (working) or ✗ with the error.
+- **Test a feed** — click ⚡. Shows ✓, ✗ with the error, or ⏱ when slow; a successful test revives an auto-skipped feed.
+- **Slow feeds** — shown as ⏱. A timeout is not a failure: the next attempt gets a longer timeout (up to 8 minutes).
+- **Skip a feed** — click ⏸ to leave it out of refreshes, ▶ to include it again.
 - **Copy a feed's URL** — click ⧉.
 - **Remove a feed** — click × next to it, or **Remove all** in settings.
 - **Import /export OPML** — buttons in ⚙ settings.
